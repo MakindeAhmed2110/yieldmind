@@ -313,14 +313,14 @@ export function YieldMind() {
         </header>
 
         <main className="flex flex-1 flex-col overflow-hidden pb-24">
-          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-6">
+          <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col space-y-4 overflow-y-auto px-4 py-6">
             {messages.map((m, i) => (
               <div
                 key={`${i}-${m.role}`}
                 className={
                   m.role === "user"
                     ? "flex justify-end"
-                    : "flex justify-center"
+                    : "flex justify-start"
                 }
               >
                 {m.role === "user" ? (
@@ -335,7 +335,9 @@ export function YieldMind() {
               </div>
             ))}
             {loading && (
-              <p className="text-[#009922] animate-pulse">Thinking…</p>
+              <div className="flex justify-start">
+                <p className="text-[#009922] animate-pulse">Thinking…</p>
+              </div>
             )}
             <div ref={bottomRef} />
           </div>

@@ -1,6 +1,8 @@
 import type { ActionFunctionArgs } from "react-router";
-import { verifyMessage } from "viem";
+import { formatUnits, parseUnits, verifyMessage } from "viem";
+import { getWalletBalances } from "@lifi/sdk";
 import {
+  NATIVE_TOKEN,
   type ComposerQuoteParams,
   buildComposerQuoteApiUrl,
   buildJumperDepositUrl,
@@ -31,16 +33,20 @@ Tools and honesty:
 - If the user asks for something you cannot do with the available tools, say clearly, suggest they "request a feature", and that the team can add it—do not pretend you have capabilities you do not.
 - Do not recite long descriptions of your tools unless the user explicitly asks how tools work.
 - APY values from tools are decimals (e.g. 0.0534 = 5.34%). Never invent contract addresses, APYs, or protocols.
+- For wallet balance questions (e.g. "my ETH on Base"), call the wallet balances tool when a verified wallet session exists.
 
 Errors:
 - If tool or upstream responses indicate a 5xx / internal server error or repeated failures, tell the Wallet Holder to try again later.
 
 Deposits (Composer):
 - Composer uses GET ${COMPOSER_ORIGIN}/v1/quote. Use the vault **LP / receipt token** as \`toToken\` (Earn \`lpTokens\`); \`fromToken\` is what the user spends (often the underlying asset; native ETH uses 0x0000…0000 per LI.FI). For **one-prompt / in-app deposits**, call \`preview_composer_quote\` with the **verified** session wallet as \`userAddress\`, a concrete \`fromAmount\` (smallest units), and correct chain/token addresses. When the quote succeeds, YieldMind shows **Execute deposit** so the Wallet Holder signs in-app. You may still mention Jumper as an alternative. Cross-chain: \`fromChain\` and \`toChain\` may differ.
+- If userAddress is missing/ambiguous in tool-call planning, assume the verified session wallet and proceed.
+- For a direct deposit intent, prefer a single \`preview_composer_quote\` call (with natural fields if needed) rather than multiple exploratory tool calls.
 
 Presentation:
 - Answer in plain language. Prefer short lists or compact tables for comparisons. Do not ask the Wallet Holder to read raw JSON—summarize tool output.
 - Omit long hex addresses and other low-level fields by default; include them only if the Wallet Holder asks for technical detail or a specific link.
+- Do not include external URLs or markdown links in normal answers unless the Wallet Holder explicitly asks for a link.
 - Do not tell the Wallet Holder to "go do more research" as a brush-off—you are part of their research flow.`;
 
 type ChatMessage = {
@@ -82,6 +88,7 @@ const tools = [
         type: "object",
         properties: {
           chainId: { type: "integer", description: "EVM chain id (e.g. 8453 Base, 42161 Arbitrum)" },
+          query: { type: "string", description: "Vault name or slug search, e.g. Gauntlet USDC Prime" },
           asset: { type: "string", description: "Token symbol or address e.g. USDC" },
           protocol: { type: "string", description: "Protocol id e.g. morpho-v1, aave-v3" },
           minTvlUsd: { type: "number", description: "Minimum TVL in USD" },
@@ -127,9 +134,26 @@ const tools = [
   {
     type: "function" as const,
     function: {
+      name: "get_wallet_balances",
+      description:
+        "Get wallet token balances across chains, or for one chain (requires verified wallet).",
+      parameters: {
+        type: "object",
+        required: ["userAddress"],
+        properties: {
+          userAddress: { type: "string", description: "0x wallet address" },
+          chainId: { type: "integer", description: "Optional EVM chain id filter" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
       name: "preview_composer_quote",
       description:
-        "Preview a LI.FI Composer quote (GET /v1/quote on li.quest). Set toToken to the vault LP token from Earn; fromToken to the asset the user spends. fromAmount is smallest units (string). Returns jumperDepositUrl + quoteApiUrl + summary.",
+        "Preview a LI.FI Composer quote (GET /v1/quote on li.quest). Accepts either exact token addresses/base units OR natural inputs (vaultQuery, fromTokenSymbol, fromAmountDecimal) and resolves them. Returns quote summary.",
       parameters: {
         type: "object",
         required: [
@@ -155,6 +179,23 @@ const tools = [
             type: "string",
             description: "Amount in base units as string, e.g. 1000000 for 1 USDC",
           },
+          vaultQuery: {
+            type: "string",
+            description: "Optional vault name/slug for resolution, e.g. RE7USDC",
+          },
+          fromTokenSymbol: {
+            type: "string",
+            description: "Optional symbol for resolution, e.g. USDC or ETH",
+          },
+          fromAmountDecimal: {
+            type: "string",
+            description:
+              "Optional human amount, e.g. 0.1. Converted to base units using token decimals.",
+          },
+          protocol: {
+            type: "string",
+            description: "Optional protocol hint, e.g. morpho-v1",
+          },
           userAddress: { type: "string", description: "0x wallet (fromAddress / toAddress)" },
         },
         additionalProperties: false,
@@ -175,23 +216,35 @@ async function runTool(
     }
     case "list_protocols": {
       const protocols = await fetchEarnProtocols();
-      return JSON.stringify(protocols);
+      return JSON.stringify(
+        protocols.map((p) => ({
+          name: p.name,
+        })),
+      );
     }
     case "list_vaults": {
+      const query =
+        typeof args.query === "string" ? args.query.trim().toLowerCase() : "";
+      const requestedChainId =
+        typeof args.chainId === "number" ? args.chainId : undefined;
+      const requestedAsset =
+        typeof args.asset === "string" ? args.asset : undefined;
+      const requestedProtocol =
+        typeof args.protocol === "string" ? args.protocol : undefined;
       const limit = Math.min(
         25,
-        typeof args.limit === "number" ? args.limit : 10,
+        typeof args.limit === "number" ? args.limit : query ? 25 : 10,
       );
-      const res = await fetchEarnVaults({
-        chainId: typeof args.chainId === "number" ? args.chainId : undefined,
-        asset: typeof args.asset === "string" ? args.asset : undefined,
-        protocol: typeof args.protocol === "string" ? args.protocol : undefined,
+      let res = await fetchEarnVaults({
+        chainId: requestedChainId,
+        asset: requestedAsset,
+        protocol: requestedProtocol,
         minTvlUsd:
           typeof args.minTvlUsd === "number" ? args.minTvlUsd : undefined,
         sortBy: args.sortBy === "apy" || args.sortBy === "tvl" ? args.sortBy : "apy",
         limit,
       });
-      const vaults = res.data as Array<{
+      let vaults = res.data as Array<{
         address: string;
         chainId: number;
         slug: string;
@@ -204,11 +257,36 @@ async function runTool(
           tvl?: { usd?: string };
         };
       }>;
-      const compact = vaults.map((v) => ({
+      let filteredVaults = query
+        ? vaults.filter((v) => {
+            const name = v.name?.toLowerCase() ?? "";
+            const slug = v.slug?.toLowerCase() ?? "";
+            return name.includes(query) || slug.includes(query);
+          })
+        : vaults;
+
+      // If a name query returns no rows, broaden search by dropping asset/protocol
+      // while keeping chain. This handles cases where users ask for branded vault names
+      // that don't line up with protocol filter ids.
+      if (query && filteredVaults.length === 0) {
+        res = await fetchEarnVaults({
+          chainId: requestedChainId,
+          minTvlUsd:
+            typeof args.minTvlUsd === "number" ? args.minTvlUsd : undefined,
+          sortBy:
+            args.sortBy === "apy" || args.sortBy === "tvl" ? args.sortBy : "apy",
+          limit: 25,
+        });
+        vaults = res.data as typeof vaults;
+        filteredVaults = vaults.filter((v) => {
+          const name = v.name?.toLowerCase() ?? "";
+          const slug = v.slug?.toLowerCase() ?? "";
+          return name.includes(query) || slug.includes(query);
+        });
+      }
+      const compact = filteredVaults.map((v) => ({
         name: v.name,
-        slug: v.slug,
         chainId: v.chainId,
-        address: v.address,
         protocol: v.protocol?.name,
         assets: v.underlyingTokens?.map((t) => t.symbol),
         underlyingToken: v.underlyingTokens?.[0]?.address,
@@ -217,7 +295,7 @@ async function runTool(
         tvlUsd: v.analytics?.tvl?.usd,
       }));
       return JSON.stringify({
-        total: res.total,
+        total: filteredVaults.length,
         nextCursor: res.nextCursor,
         vaults: compact,
       });
@@ -248,24 +326,209 @@ async function runTool(
       const p = await fetchEarnPortfolio(userAddress);
       return JSON.stringify(p);
     }
-    case "preview_composer_quote": {
-      const userAddress = args.userAddress as string;
-      if (!/^0x[a-fA-F0-9]{40}$/.test(userAddress)) {
-        return JSON.stringify({ error: "Invalid userAddress" });
-      }
-      const p = {
-        fromChain: Number(args.fromChainId),
-        toChain: Number(args.toChainId),
-        fromToken: args.fromToken as string,
-        toToken: args.toToken as string,
-        fromAmount: String(args.fromAmount),
-        fromAddress: userAddress as `0x${string}`,
-      };
+    case "get_wallet_balances": {
+      const userAddress = args.userAddress as `0x${string}`;
+      const chainId =
+        typeof args.chainId === "number" ? Number(args.chainId) : undefined;
       if (
-        [p.fromChain, p.toChain].some((n) => !Number.isFinite(n) || n < 1)
+        verified &&
+        userAddress.toLowerCase() !== verified.toLowerCase()
+      ) {
+        return JSON.stringify({
+          error:
+            "Balance address must match the connected and signed wallet.",
+        });
+      }
+      if (!verified) {
+        return JSON.stringify({
+          error:
+            "User must connect wallet and sign the YieldMind session message to load balances.",
+        });
+      }
+      const balancesByChain = await getWalletBalances(userAddress);
+      const chainRows = Object.entries(balancesByChain)
+        .map(([cid, tokens]) => ({
+          chainId: Number(cid),
+          tokens: tokens as unknown as Array<Record<string, unknown>>,
+        }))
+        .filter((row) => (chainId ? row.chainId === chainId : true))
+        .map((row) => {
+          const tokens = row.tokens
+            .map((t) => {
+              const raw = String(t.amount ?? "0");
+              const decimals =
+                typeof t.decimals === "number" ? t.decimals : 18;
+              let formatted = "0";
+              try {
+                formatted = formatUnits(BigInt(raw), decimals);
+              } catch {
+                formatted = "0";
+              }
+              const valueUsd =
+                typeof t.priceUSD === "string"
+                  ? Number(t.priceUSD) * Number(formatted)
+                  : typeof t.priceUSD === "number"
+                    ? t.priceUSD * Number(formatted)
+                    : null;
+              return {
+                symbol: String(t.symbol ?? ""),
+                address: String(t.address ?? ""),
+                amount: raw,
+                formatted,
+                decimals,
+                valueUsd:
+                  valueUsd != null && Number.isFinite(valueUsd)
+                    ? Number(valueUsd.toFixed(2))
+                    : null,
+              };
+            })
+            .filter((t) => t.symbol && t.formatted !== "0")
+            .sort((a, b) => (b.valueUsd ?? 0) - (a.valueUsd ?? 0));
+          return {
+            chainId: row.chainId,
+            tokenCount: tokens.length,
+            tokens: tokens.slice(0, 20),
+          };
+        });
+      return JSON.stringify({
+        userAddress,
+        chainId: chainId ?? null,
+        chains: chainRows,
+      });
+    }
+    case "preview_composer_quote": {
+      const isAddress = (v: string): boolean => /^0x[a-fA-F0-9]{40}$/.test(v);
+      const requestedUserAddress =
+        typeof args.userAddress === "string" ? args.userAddress.trim() : "";
+      const userAddress = isAddress(requestedUserAddress)
+        ? requestedUserAddress
+        : verified ?? "";
+      if (!isAddress(userAddress)) {
+        return JSON.stringify({
+          error:
+            "User must connect wallet and sign the YieldMind session message before previewing deposits.",
+        });
+      }
+      if (
+        verified &&
+        userAddress.toLowerCase() !== verified.toLowerCase()
+      ) {
+        return JSON.stringify({
+          error:
+            "Quote address must match the connected and signed wallet.",
+        });
+      }
+      const fromChain = Number(args.fromChainId);
+      const toChain = Number(args.toChainId);
+      if (
+        [fromChain, toChain].some((n) => !Number.isFinite(n) || n < 1)
       ) {
         return JSON.stringify({ error: "Invalid chain ids" });
       }
+      let fromToken = String(args.fromToken ?? "").trim();
+      let toToken = String(args.toToken ?? "").trim();
+      let fromAmount = String(args.fromAmount ?? "").trim();
+
+      const vaultQuery =
+        typeof args.vaultQuery === "string" ? args.vaultQuery.trim() : "";
+      const protocolHint =
+        typeof args.protocol === "string" ? args.protocol.trim() : undefined;
+      const symbolHint =
+        typeof args.fromTokenSymbol === "string"
+          ? args.fromTokenSymbol.trim().toUpperCase()
+          : "";
+
+      // Resolve natural-language fields into strict Composer params.
+      if (!isAddress(toToken) || !isAddress(fromToken) || !/^\d+$/.test(fromAmount)) {
+        const querySource = vaultQuery || (!isAddress(toToken) ? toToken : "");
+        const res = await fetchEarnVaults({
+          chainId: toChain,
+          protocol: protocolHint,
+          limit: 25,
+          sortBy: "tvl",
+        });
+        const vaults = (res.data as Array<{
+          name?: string;
+          slug?: string;
+          lpTokens?: Array<{ symbol?: string; address?: string; decimals?: number }>;
+          underlyingTokens?: Array<{ symbol?: string; address?: string; decimals?: number }>;
+        }>) ?? [];
+        const q = querySource.trim().toLowerCase();
+        const filtered = q
+          ? vaults.filter((v) => {
+              const n = (v.name ?? "").toLowerCase();
+              const s = (v.slug ?? "").toLowerCase();
+              return n.includes(q) || s.includes(q);
+            })
+          : vaults;
+        const pickedVault = filtered[0];
+        if (!pickedVault) {
+          return JSON.stringify({
+            error:
+              "Could not resolve vault from the request. Please mention a vault name available on the target chain.",
+          });
+        }
+
+        if (!isAddress(toToken)) {
+          const lp = pickedVault.lpTokens?.find((t) => isAddress(String(t.address ?? "")));
+          if (!lp?.address) {
+            return JSON.stringify({
+              error: "Selected vault has no valid LP token for Composer.",
+            });
+          }
+          toToken = lp.address;
+        }
+
+        let resolvedDecimals =
+          typeof args.fromTokenDecimals === "number" ? args.fromTokenDecimals : undefined;
+        if (!isAddress(fromToken)) {
+          const normalized = (symbolHint || fromToken).toUpperCase();
+          if (normalized === "ETH" || normalized === "NATIVE") {
+            fromToken = NATIVE_TOKEN;
+            resolvedDecimals = 18;
+          } else {
+            const underlying = pickedVault.underlyingTokens?.find(
+              (t) => (t.symbol ?? "").toUpperCase() === normalized,
+            );
+            if (!underlying?.address || !isAddress(underlying.address)) {
+              return JSON.stringify({
+                error:
+                  "Could not resolve fromToken for this vault. Try specifying the exact asset symbol (e.g. USDC).",
+              });
+            }
+            fromToken = underlying.address;
+            if (typeof underlying.decimals === "number") {
+              resolvedDecimals = underlying.decimals;
+            }
+          }
+        }
+
+        if (!/^\d+$/.test(fromAmount)) {
+          const humanRaw =
+            typeof args.fromAmountDecimal === "string"
+              ? args.fromAmountDecimal
+              : fromAmount;
+          const human = humanRaw.replace(/[^0-9.]/g, "");
+          const decimals = resolvedDecimals ?? 6;
+          try {
+            fromAmount = parseUnits(human, decimals).toString();
+          } catch {
+            return JSON.stringify({
+              error:
+                "Invalid amount format. Use a positive numeric amount such as 0.1.",
+            });
+          }
+        }
+      }
+
+      const p: ComposerQuoteParams = {
+        fromChain,
+        toChain,
+        fromToken,
+        toToken,
+        fromAmount,
+        fromAddress: userAddress as `0x${string}`,
+      };
       const { ok, summary } = await fetchComposerQuotePreview(p);
       return JSON.stringify({
         ok,
@@ -357,7 +620,7 @@ export async function action({ request }: ActionFunctionArgs) {
   let lastComposerExecute: ComposerQuoteParams | null = null;
 
   try {
-  const maxSteps = 5;
+  const maxSteps = 6;
   for (let step = 0; step < maxSteps; step++) {
     const res = await fetch(OPENROUTER_URL, {
       method: "POST",
