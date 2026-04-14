@@ -18,6 +18,8 @@ import {
 } from "~/lib/earn-api";
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const BASE_USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const MORPHO_BASE_RE7USDC = "0x7bfa7c4f149e7415b73bdedfe609237e29cbf34a";
 const COMPOSER_SUPPORTED_PROTOCOLS = new Set([
   "morpho-v1",
   "aave-v3",
@@ -50,6 +52,7 @@ Tools and honesty:
 - If the user asks for something you cannot do with the available tools, say clearly, suggest they "request a feature", and that the team can add it—do not pretend you have capabilities you do not.
 - Do not recite long descriptions of your tools unless the user explicitly asks how tools work.
 - APY values from tools are decimals (e.g. 0.0534 = 5.34%). Never invent contract addresses, APYs, or protocols.
+- For "risk-adjusted APY" requests, use the dedicated risk-adjusted tool and explain that the adjustment is a transparent heuristic over live data (not financial advice).
 - For wallet balance questions (e.g. "my ETH on Base"), call the wallet balances tool when a verified wallet session exists.
 
 Errors:
@@ -59,6 +62,7 @@ Deposits (Composer):
 - Composer uses GET ${COMPOSER_ORIGIN}/v1/quote. Use the vault **LP / receipt token** as \`toToken\` (Earn \`lpTokens\`); \`fromToken\` is what the user spends (often the underlying asset; native ETH uses 0x0000…0000 per LI.FI). For **one-prompt / in-app deposits**, call \`preview_composer_quote\` with the **verified** session wallet as \`userAddress\`, a concrete \`fromAmount\` (smallest units), and correct chain/token addresses. When the quote succeeds, YieldMind shows **Execute deposit** so the Wallet Holder signs in-app. You may still mention Jumper as an alternative. Cross-chain: \`fromChain\` and \`toChain\` may differ.
 - If userAddress is missing/ambiguous in tool-call planning, assume the verified session wallet and proceed.
 - For a direct deposit intent, prefer a single \`preview_composer_quote\` call (with natural fields if needed) rather than multiple exploratory tool calls.
+- For plain-language requests like "deposit into RE7USDC on Base", resolve internally to the known Morpho Base vault token and proceed without asking the Wallet Holder for token addresses.
 - Do not suggest or attempt Composer deposit on unsupported protocols. If unsupported (e.g. yo-protocol), explain clearly and suggest Composer-supported alternatives from the current chain.
 
 Presentation:
@@ -109,7 +113,6 @@ function parseDepositIntent(text: string): DepositIntent | null {
     : /\byo\b/i.test(raw)
       ? "yo-protocol"
       : undefined;
-
   return { amountDecimal, fromTokenSymbol, vaultQuery, chainId, protocol };
 }
 
@@ -146,6 +149,30 @@ const tools = [
           minTvlUsd: { type: "number", description: "Minimum TVL in USD" },
           sortBy: { type: "string", enum: ["apy", "tvl"] },
           limit: { type: "integer", minimum: 1, maximum: 25 },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "risk_adjusted_vaults",
+      description:
+        "List vaults with risk-adjusted APY based on live Earn data and transparent heuristic penalties.",
+      parameters: {
+        type: "object",
+        properties: {
+          chainId: { type: "integer", description: "EVM chain id (e.g. 8453 Base)" },
+          asset: { type: "string", description: "Token symbol or address e.g. USDC" },
+          protocol: { type: "string", description: "Protocol id e.g. morpho-v1, aave-v3" },
+          minTvlUsd: { type: "number", description: "Minimum TVL in USD" },
+          limit: { type: "integer", minimum: 1, maximum: 25 },
+          riskTolerance: {
+            type: "string",
+            enum: ["low", "medium", "high"],
+            description: "Lower tolerance applies stronger penalties.",
+          },
         },
         additionalProperties: false,
       },
@@ -356,6 +383,104 @@ async function runTool(
         vaults: compact,
       });
     }
+    case "risk_adjusted_vaults": {
+      const limit = Math.min(
+        25,
+        typeof args.limit === "number" ? args.limit : 10,
+      );
+      const riskTolerance =
+        args.riskTolerance === "low" ||
+        args.riskTolerance === "medium" ||
+        args.riskTolerance === "high"
+          ? args.riskTolerance
+          : "medium";
+      const toleranceMultiplier =
+        riskTolerance === "low" ? 1.2 : riskTolerance === "high" ? 0.85 : 1;
+
+      const res = await fetchEarnVaults({
+        chainId: typeof args.chainId === "number" ? args.chainId : undefined,
+        asset: typeof args.asset === "string" ? args.asset : undefined,
+        protocol: typeof args.protocol === "string" ? args.protocol : undefined,
+        minTvlUsd:
+          typeof args.minTvlUsd === "number" ? args.minTvlUsd : undefined,
+        sortBy: "apy",
+        limit,
+      });
+
+      const vaults = res.data as Array<{
+        chainId: number;
+        name: string;
+        protocol?: { name: string };
+        underlyingTokens?: Array<{ symbol: string }>;
+        analytics?: {
+          apy?: { total: number };
+          tvl?: { usd?: string };
+        };
+      }>;
+
+      const chainPenaltyById: Record<number, number> = {
+        1: 0.05,
+        8453: 0.06,
+        42161: 0.07,
+        10: 0.08,
+      };
+
+      const protocolPenalty = (p?: string): number => {
+        const id = (p ?? "").toLowerCase().replace(/\s+/g, "-");
+        if (id.includes("aave")) return 0.05;
+        if (id.includes("morpho")) return 0.08;
+        if (id.includes("euler")) return 0.09;
+        if (id.includes("pendle")) return 0.12;
+        return 0.15;
+      };
+
+      const tvlPenalty = (tvlUsd: number): number => {
+        if (tvlUsd >= 10_000_000) return 0.06;
+        if (tvlUsd >= 2_000_000) return 0.12;
+        if (tvlUsd >= 500_000) return 0.22;
+        return 0.35;
+      };
+
+      const riskRows = vaults
+        .map((v) => {
+          const rawApy = Number(v.analytics?.apy?.total ?? 0);
+          const tvlUsd = Number(v.analytics?.tvl?.usd ?? 0);
+          const chainPenalty = chainPenaltyById[v.chainId] ?? 0.1;
+          const protoPenalty = protocolPenalty(v.protocol?.name);
+          const liqPenalty = tvlPenalty(tvlUsd);
+          const basePenalty = chainPenalty + protoPenalty + liqPenalty;
+          const adjustedPenalty = Math.min(0.85, basePenalty * toleranceMultiplier);
+          const riskAdjustedApy = rawApy * (1 - adjustedPenalty);
+          const riskScore = Math.max(1, Math.round((1 - adjustedPenalty) * 100));
+          return {
+            name: v.name,
+            chainId: v.chainId,
+            protocol: v.protocol?.name,
+            asset: v.underlyingTokens?.[0]?.symbol ?? null,
+            apy: rawApy,
+            apyPct: Number((rawApy * 100).toFixed(2)),
+            riskAdjustedApy,
+            riskAdjustedApyPct: Number((riskAdjustedApy * 100).toFixed(2)),
+            riskScore,
+            tvlUsd,
+            penalties: {
+              chain: chainPenalty,
+              protocol: protoPenalty,
+              liquidity: liqPenalty,
+              total: adjustedPenalty,
+            },
+          };
+        })
+        .sort((a, b) => b.riskAdjustedApy - a.riskAdjustedApy);
+
+      return JSON.stringify({
+        methodology:
+          "Risk-adjusted APY is a heuristic over live APY + chain/protocol/liquidity penalties.",
+        riskTolerance,
+        total: riskRows.length,
+        vaults: riskRows,
+      });
+    }
     case "get_vault": {
       const chainId = args.chainId as number;
       const address = args.address as string;
@@ -500,7 +625,7 @@ async function runTool(
           ok: false,
           summary: {
             error:
-              "Unsupported protocol for Composer deposit. Try Morpho, Aave, Euler, Pendle, or other supported protocols.",
+              "Unsupported protocol for Composer execution. Try Morpho, Aave, Euler, Pendle, or other supported protocols.",
             unsupportedProtocol: protocolHint,
           },
         });
@@ -509,6 +634,21 @@ async function runTool(
         typeof args.fromTokenSymbol === "string"
           ? args.fromTokenSymbol.trim().toUpperCase()
           : "";
+
+      // Demo-safe NL alias: "RE7USDC on Base" -> known Composer vault token.
+      const normalizedToToken = toToken.toLowerCase();
+      const isRe7Alias =
+        vaultQuery.toLowerCase().includes("re7usdc") ||
+        normalizedToToken.includes("re7usdc");
+      if (toChain === 8453 && isRe7Alias) {
+        toToken = MORPHO_BASE_RE7USDC;
+      }
+      if (
+        fromChain === 8453 &&
+        (symbolHint === "USDC" || fromToken.toUpperCase() === "USDC")
+      ) {
+        fromToken = BASE_USDC;
+      }
 
       // Resolve natural-language fields into strict Composer params.
       if (!isAddress(toToken) || !isAddress(fromToken) || !/^\d+$/.test(fromAmount)) {
@@ -554,6 +694,8 @@ async function runTool(
           });
         }
 
+        let resolvedDecimals =
+          typeof args.fromTokenDecimals === "number" ? args.fromTokenDecimals : undefined;
         if (!isAddress(toToken)) {
           const lp = pickedVault.lpTokens?.find((t) => isAddress(String(t.address ?? "")));
           if (!lp?.address) {
@@ -563,9 +705,6 @@ async function runTool(
           }
           toToken = lp.address;
         }
-
-        let resolvedDecimals =
-          typeof args.fromTokenDecimals === "number" ? args.fromTokenDecimals : undefined;
         if (!isAddress(fromToken)) {
           const normalized = (symbolHint || fromToken).toUpperCase();
           if (normalized === "ETH" || normalized === "NATIVE") {
@@ -706,6 +845,8 @@ export async function action({ request }: ActionFunctionArgs) {
   let lastComposerExecute: ComposerQuoteParams | null = null;
 
   try {
+  const lastUser = [...msgs].reverse().find((m) => m.role === "user")?.content ?? "";
+
   const maxSteps = 6;
   for (let step = 0; step < maxSteps; step++) {
     const res = await fetch(OPENROUTER_URL, {
@@ -713,7 +854,7 @@ export async function action({ request }: ActionFunctionArgs) {
       headers: {
         Authorization: `Bearer ${key}`,
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://yieldmind.local",
+        "HTTP-Referer": "https://yield.lucidapp.xyz",
         "X-Title": "YieldMind",
       },
       body: JSON.stringify({
@@ -811,7 +952,6 @@ export async function action({ request }: ActionFunctionArgs) {
     });
   }
 
-  const lastUser = [...msgs].reverse().find((m) => m.role === "user")?.content ?? "";
   const intent = parseDepositIntent(lastUser);
   if (intent && verified) {
     const fallbackResult = await runTool(

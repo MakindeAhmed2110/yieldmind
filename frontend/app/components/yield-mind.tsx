@@ -269,6 +269,41 @@ export function YieldMind() {
 
   const connected = status === "connected" && address;
 
+  if (!connected) {
+    return (
+      <div className="relative min-h-screen bg-black text-[#00ff41] font-mono text-sm">
+        <MatrixBackground />
+        <div className="relative z-10 flex min-h-screen items-center justify-center px-6">
+          <div className="w-full max-w-xl text-center">
+            <img
+              src="/logo.jpg"
+              alt="YieldMind logo"
+              className="mx-auto mb-6 h-24 w-24 rounded-2xl border border-[#003311] object-cover"
+            />
+            <h1 className="text-4xl font-bold tracking-wide text-[#00ff66]">
+              YieldMind
+            </h1>
+            <p className="mt-3 text-sm text-[#00cc55]">
+              The Best AI Agent for Maximizing Crypto Yields
+            </p>
+            <p className="mt-4 text-xs leading-relaxed text-[#00aa44]">
+              Discover live DeFi yield opportunities and execute Composer routes
+              with your own wallet on supported chains.
+            </p>
+            <button
+              type="button"
+              disabled={isConnecting || !connectors[0]}
+              onClick={() => connect({ connector: connectors[0]! })}
+              className="mt-8 rounded border border-[#00aa44] bg-[#001a0d] px-4 py-2 text-xs text-[#00ff66] hover:bg-[#002211] disabled:opacity-50"
+            >
+              {isConnecting ? "Connecting…" : "Connect Wallet"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="relative min-h-screen bg-black text-[#00ff41] font-mono text-sm">
       <MatrixBackground />
