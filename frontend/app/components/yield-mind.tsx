@@ -36,6 +36,24 @@ type Session = {
 
 type ChatLine = { role: "user" | "assistant"; content: string };
 
+function extractLastTxHash(routeResult: unknown): string | null {
+  if (!routeResult || typeof routeResult !== "object") return null;
+  const steps = (routeResult as { steps?: Array<unknown> }).steps;
+  if (!Array.isArray(steps)) return null;
+
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const execution = (steps[i] as { execution?: { process?: Array<unknown> } })
+      .execution;
+    const process = execution?.process;
+    if (!Array.isArray(process)) continue;
+    for (let j = process.length - 1; j >= 0; j--) {
+      const txHash = (process[j] as { txHash?: unknown }).txHash;
+      if (typeof txHash === "string" && txHash.trim()) return txHash;
+    }
+  }
+  return null;
+}
+
 function loadSession(): Session | null {
   if (typeof window === "undefined") return null;
   try {
@@ -227,14 +245,17 @@ export function YieldMind() {
     setExecutingComposer(true);
     setComposerError(null);
     try {
-      await executeComposerDeposit(composerAction);
+      const routeResult = await executeComposerDeposit(composerAction);
+      const txHash = extractLastTxHash(routeResult);
       setComposerAction(null);
       setMessages((m) => [
         ...m,
         {
           role: "assistant",
           content:
-            "Composer route finished in your wallet. Check your transaction history and Earn positions.",
+            txHash
+              ? `Composer route finished in your wallet.\nTransaction hash: ${txHash}\nCheck your transaction history and Earn positions.`
+              : "Composer route finished in your wallet. Check your transaction history and Earn positions.",
         },
       ]);
     } catch (e) {

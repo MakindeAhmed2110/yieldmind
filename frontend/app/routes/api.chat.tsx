@@ -18,6 +18,23 @@ import {
 } from "~/lib/earn-api";
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const COMPOSER_SUPPORTED_PROTOCOLS = new Set([
+  "morpho-v1",
+  "aave-v3",
+  "euler-v2",
+  "hyperlend",
+  "maple",
+  "seamless",
+  "pendle",
+  "ethena",
+  "neverland",
+  "etherfi",
+  "lido-wsteth",
+  "kinetiq",
+  "kinetiq-earn",
+  "felix-vanilla",
+  "usdai",
+]);
 
 const SYSTEM = `You are YieldMind. You help users find and compare on-chain yield (DeFi vaults, lending, staking) using LI.FI Earn data and Composer quotes. You may use your tools to fetch live data; on-chain execution is initiated by the Wallet Holder in-app (Execute deposit) or via Jumper after a successful quote preview.
 
@@ -42,6 +59,7 @@ Deposits (Composer):
 - Composer uses GET ${COMPOSER_ORIGIN}/v1/quote. Use the vault **LP / receipt token** as \`toToken\` (Earn \`lpTokens\`); \`fromToken\` is what the user spends (often the underlying asset; native ETH uses 0x0000…0000 per LI.FI). For **one-prompt / in-app deposits**, call \`preview_composer_quote\` with the **verified** session wallet as \`userAddress\`, a concrete \`fromAmount\` (smallest units), and correct chain/token addresses. When the quote succeeds, YieldMind shows **Execute deposit** so the Wallet Holder signs in-app. You may still mention Jumper as an alternative. Cross-chain: \`fromChain\` and \`toChain\` may differ.
 - If userAddress is missing/ambiguous in tool-call planning, assume the verified session wallet and proceed.
 - For a direct deposit intent, prefer a single \`preview_composer_quote\` call (with natural fields if needed) rather than multiple exploratory tool calls.
+- Do not suggest or attempt Composer deposit on unsupported protocols. If unsupported (e.g. yo-protocol), explain clearly and suggest Composer-supported alternatives from the current chain.
 
 Presentation:
 - Answer in plain language. Prefer short lists or compact tables for comparisons. Do not ask the Wallet Holder to read raw JSON—summarize tool output.
@@ -60,6 +78,40 @@ type ChatMessage = {
     function: { name: string; arguments: string };
   }>;
 };
+
+type DepositIntent = {
+  amountDecimal: string;
+  fromTokenSymbol: string;
+  vaultQuery: string;
+  chainId: number;
+  protocol?: string;
+};
+
+function parseDepositIntent(text: string): DepositIntent | null {
+  const raw = text.trim();
+  const lower = raw.toLowerCase();
+  if (!/\bdeposit\b/.test(lower)) return null;
+
+  const amt = lower.match(
+    /deposit\s+([0-9]*\.?[0-9]+)\s*([a-zA-Z]{2,10})?/,
+  );
+  const amountDecimal = amt?.[1];
+  const fromTokenSymbol = (amt?.[2] ?? "USDC").toUpperCase();
+  if (!amountDecimal) return null;
+
+  const intoVault = raw.match(/into\s+(?:the\s+)?(.+?)(?:\s+vault|\s+on\s+|$)/i);
+  const vaultQuery = intoVault?.[1]?.trim();
+  if (!vaultQuery) return null;
+
+  const chainId = /\bbase\b/i.test(raw) ? 8453 : 8453;
+  const protocol = /\bmorpho\b/i.test(raw)
+    ? "morpho-v1"
+    : /\byo\b/i.test(raw)
+      ? "yo-protocol"
+      : undefined;
+
+  return { amountDecimal, fromTokenSymbol, vaultQuery, chainId, protocol };
+}
 
 const tools = [
   {
@@ -285,9 +337,13 @@ async function runTool(
         });
       }
       const compact = filteredVaults.map((v) => ({
+        protocolId: (v.protocol?.name ?? "").toLowerCase().replace(/\s+/g, "-"),
         name: v.name,
         chainId: v.chainId,
         protocol: v.protocol?.name,
+        composerSupported: COMPOSER_SUPPORTED_PROTOCOLS.has(
+          (v.protocol?.name ?? "").toLowerCase().replace(/\s+/g, "-"),
+        ),
         assets: v.underlyingTokens?.map((t) => t.symbol),
         underlyingToken: v.underlyingTokens?.[0]?.address,
         lpToken: v.lpTokens?.[0]?.address,
@@ -433,6 +489,22 @@ async function runTool(
         typeof args.vaultQuery === "string" ? args.vaultQuery.trim() : "";
       const protocolHint =
         typeof args.protocol === "string" ? args.protocol.trim() : undefined;
+      const normalizedProtocolHint = (protocolHint ?? "")
+        .toLowerCase()
+        .replace(/\s+/g, "-");
+      if (
+        normalizedProtocolHint &&
+        !COMPOSER_SUPPORTED_PROTOCOLS.has(normalizedProtocolHint)
+      ) {
+        return JSON.stringify({
+          ok: false,
+          summary: {
+            error:
+              "Unsupported protocol for Composer deposit. Try Morpho, Aave, Euler, Pendle, or other supported protocols.",
+            unsupportedProtocol: protocolHint,
+          },
+        });
+      }
       const symbolHint =
         typeof args.fromTokenSymbol === "string"
           ? args.fromTokenSymbol.trim().toUpperCase()
@@ -466,6 +538,19 @@ async function runTool(
           return JSON.stringify({
             error:
               "Could not resolve vault from the request. Please mention a vault name available on the target chain.",
+          });
+        }
+        const protocolName = (pickedVault as { protocol?: { name?: string } })
+          .protocol?.name;
+        const protocolId = (protocolName ?? "").toLowerCase().replace(/\s+/g, "-");
+        if (protocolId && !COMPOSER_SUPPORTED_PROTOCOLS.has(protocolId)) {
+          return JSON.stringify({
+            ok: false,
+            summary: {
+              error:
+                "Selected vault protocol is not Composer-supported for deposits.",
+              unsupportedProtocol: protocolName,
+            },
           });
         }
 
@@ -535,6 +620,7 @@ async function runTool(
         summary,
         quoteApiUrl: buildComposerQuoteApiUrl(p),
         jumperDepositUrl: buildJumperDepositUrl(p),
+        resolved: p,
       });
     }
     default:
@@ -681,23 +767,21 @@ export async function action({ request }: ActionFunctionArgs) {
         const result = await runTool(tc.function.name, args, verified);
         if (tc.function.name === "preview_composer_quote" && verified) {
           try {
-            const parsed = JSON.parse(result) as { ok?: boolean };
-            const ua = String(args.userAddress ?? "").toLowerCase();
+            const parsed = JSON.parse(result) as {
+              ok?: boolean;
+              resolved?: ComposerQuoteParams;
+            };
             if (
               parsed.ok &&
-              ua === verified.toLowerCase() &&
-              args.fromChainId != null &&
-              args.toChainId != null &&
-              args.fromToken &&
-              args.toToken &&
-              args.fromAmount != null
+              parsed.resolved &&
+              parsed.resolved.fromAddress.toLowerCase() === verified.toLowerCase()
             ) {
               lastComposerExecute = {
-                fromChain: Number(args.fromChainId),
-                toChain: Number(args.toChainId),
-                fromToken: String(args.fromToken),
-                toToken: String(args.toToken),
-                fromAmount: String(args.fromAmount),
+                fromChain: parsed.resolved.fromChain,
+                toChain: parsed.resolved.toChain,
+                fromToken: parsed.resolved.fromToken,
+                toToken: parsed.resolved.toToken,
+                fromAmount: parsed.resolved.fromAmount,
                 fromAddress: verified,
               };
             }
@@ -725,6 +809,47 @@ export async function action({ request }: ActionFunctionArgs) {
         ? { composer: lastComposerExecute }
         : {}),
     });
+  }
+
+  const lastUser = [...msgs].reverse().find((m) => m.role === "user")?.content ?? "";
+  const intent = parseDepositIntent(lastUser);
+  if (intent && verified) {
+    const fallbackResult = await runTool(
+      "preview_composer_quote",
+      {
+        fromChainId: intent.chainId,
+        toChainId: intent.chainId,
+        fromToken: intent.fromTokenSymbol,
+        fromTokenSymbol: intent.fromTokenSymbol,
+        fromAmountDecimal: intent.amountDecimal,
+        fromAmount: intent.amountDecimal,
+        toToken: intent.vaultQuery,
+        vaultQuery: intent.vaultQuery,
+        protocol: intent.protocol,
+        userAddress: verified,
+      },
+      verified,
+    );
+    try {
+      const parsed = JSON.parse(fallbackResult) as {
+        ok?: boolean;
+        summary?: Record<string, unknown>;
+        resolved?: ComposerQuoteParams;
+      };
+      if (parsed.ok && parsed.resolved) {
+        return Response.json({
+          reply:
+            "I found a direct Composer preview for your deposit request. Review and execute when ready.",
+          composer: parsed.resolved,
+        });
+      }
+      return Response.json({
+        reply:
+          "I could not build an executable route for that vault yet. Try another Base vault from the list or a larger amount.",
+      });
+    } catch {
+      // fall through to loop-limit response
+    }
   }
 
   return Response.json({ error: "Tool loop limit" }, { status: 500 });
